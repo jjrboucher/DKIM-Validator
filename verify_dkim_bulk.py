@@ -18,22 +18,27 @@
 """
 DKIM Bulk Signature Verifier with Advanced Forensic Toggles, Target Controls, and Regex Validation.
 
+v1.7.2 changes
+  * All_Signatures summary now shows each signature's x= expiry and expiry state.
+  * New Signatures_Expired column in the main report.
+  * Key record flags parsed and reported: key size (bits), t=y (testing mode), t=s (strict
+    identity), h= (permitted hashes), s= (service types), n= (notes). New Key_Bits and
+    Key_Flags columns; keys_manifest.csv extended accordingly.
+  * Key flags enforced per RFC 6376: t=s requires i= to use exactly the d= domain; a key h=
+    list restricts the hash algorithms the key may be used with. Testing-mode keys are noted.
+
 v1.7.1 changes
-  * Every public key used (from DNS, sidecar, nomenclature or global key) is preserved in the
-    output keys/ folder as <selector>._domainkey.<domain>.key, with keys_manifest.csv recording
-    source, retrieval time, SHA-256 and the emails/signatures that used each key.
-  * New Saved_Key_File column in both CSV ledgers.
+  * Every public key used is preserved in the output keys/ folder as
+    <selector>._domainkey.<domain>.key, with keys_manifest.csv recording source, retrieval time,
+    SHA-256 and the emails/signatures that used each key. New Saved_Key_File column.
 
 v1.7.0 changes
-  * Mode 1 live DNS: corrected DNS-over-HTTPS URL; lookup errors are now reported, negative
-    results are cached, multi-string TXT records are joined correctly.
-  * All DKIM-Signature headers are verified (not only the first). Per-signature details are
-    written to dkim_signature_details.csv; the main CSV reports the best result per email.
-  * LF-only and mixed line endings are normalised to CRLF (working copy only) before verification.
-  * Ed25519 (ed25519-sha256, RFC 8463) signatures are verified over the SHA-256 digest of the
-    signed header block, as the RFC requires.
-  * t= (timestamp), x= (expiry) and i= (identity) tags are evaluated and reported.
-    Optional strict expiry mode treats expired signatures as FAIL.
+  * Mode 1 live DNS: corrected DNS-over-HTTPS URL; lookup errors reported; negative results cached;
+    multi-string TXT records joined.
+  * All DKIM-Signature headers are verified; per-signature details in dkim_signature_details.csv.
+  * LF-only and mixed line endings normalised to CRLF (working copy only) before verification.
+  * Ed25519 (ed25519-sha256, RFC 8463) verified over the SHA-256 digest of the signed header block.
+  * t= (timestamp), x= (expiry) and i= (identity) tags evaluated; optional strict expiry mode.
 """
 import argparse
 import base64
@@ -59,7 +64,7 @@ except ImportError:
     sys.exit("The 'cryptography' package is required: pip install cryptography")
 
 # Tool Metadata
-__version__ = "1.7.1"
+__version__ = "1.7.2"
 BUILD_DATE = "2026-11-05"
 __tool_name__ = "DKIM Bulk Signature Verifier"
 __author__ = "Jacques Boucher"
@@ -82,18 +87,12 @@ KEY_MEMORY_CACHE = {}        # selector._domainkey.domain -> TXT record text
 DNS_NEGATIVE_CACHE = {}      # selector._domainkey.domain -> reason the lookup failed
 SAVED_KEYS = {}              # (selector._domainkey.domain, key sha256) -> manifest record
 
-MANIFEST_HEADERS = [
-    "Saved_Key_File", "DKIM_Selector", "DKIM_Domain", "DNS_Name", "Key_Source_Used",
-    "Original_Key_File_Path", "First_Retrieved_UTC", "Key_SHA256", "Key_Type",
-    "Times_Used", "Used_By"
-]
-
 CSV_HEADERS = [
     "EML_Filename", "MD5_Hash", "SHA256_Hash", "Line_Endings",
-    "Signature_Count", "Signatures_Passed", "Reported_Signature",
+    "Signature_Count", "Signatures_Passed", "Signatures_Expired", "Reported_Signature",
     "DKIM_Domain", "DKIM_Selector", "DKIM_Algorithm", "DKIM_Identity",
     "Identity_Check", "Sig_Timestamp_UTC", "Sig_Expiry_UTC", "Expiry_Status",
-    "Key_Source_Used", "Key_File_Path", "Key_SHA256", "Saved_Key_File",
+    "Key_Source_Used", "Key_File_Path", "Key_SHA256", "Saved_Key_File", "Key_Bits", "Key_Flags",
     "Body_Hash_Result", "Signature_Result", "Overall_Status",
     "All_Signatures", "Threat_Alerts", "Notes"
 ]
@@ -102,24 +101,36 @@ DETAIL_HEADERS = [
     "EML_Filename", "SHA256_Hash", "Sig_Index", "DKIM_Domain", "DKIM_Selector",
     "DKIM_Algorithm", "Canonicalization", "DKIM_Identity", "Identity_Check",
     "Sig_Timestamp_UTC", "Sig_Expiry_UTC", "Expiry_Status",
-    "Key_Source_Used", "Key_File_Path", "Key_SHA256", "Saved_Key_File",
+    "Key_Source_Used", "Key_File_Path", "Key_SHA256", "Saved_Key_File", "Key_Bits", "Key_Flags",
     "Body_Hash_Result", "Signature_Result", "Signature_Status", "Notes"
+]
+
+MANIFEST_HEADERS = [
+    "Saved_Key_File", "DKIM_Selector", "DKIM_Domain", "DNS_Name", "Key_Source_Used",
+    "Original_Key_File_Path", "First_Retrieved_UTC", "Key_SHA256", "Key_Type", "Key_Bits",
+    "Key_Testing_Mode", "Key_Strict_Identity", "Key_Hash_Algs", "Key_Service_Types", "Key_Notes",
+    "Key_Flags_Raw", "Times_Used", "Used_By"
 ]
 
 
 # ---------------------------------------------------------------------------
 # Key handling
 # ---------------------------------------------------------------------------
+def _record_text(blob):
+    """Strip zone-file prefix and join quoted TXT chunks."""
+    text = blob.strip()
+    text = re.sub(r'(?im)^\s*\S+\s+(?:\d+\s+)?(?:IN\s+)?TXT\s+', '', text)
+    chunks = re.findall(r'"([^"]*)"', text)
+    return "".join(chunks) if chunks else text
+
+
 def extract_key_material(blob):
     if not blob or not blob.strip():
         raise ValueError("No key material supplied.")
     text = blob.strip()
     if "BEGIN PUBLIC KEY" in text or "BEGIN RSA PUBLIC KEY" in text:
         return "pem", text
-    text = re.sub(r'(?im)^\s*\S+\s+(?:\d+\s+)?(?:IN\s+)?TXT\s+', '', text)
-    chunks = re.findall(r'"([^"]*)"', text)
-    if chunks:
-        text = "".join(chunks)
+    text = _record_text(text)
     m = re.search(r'(?:^|;)\s*k\s*=\s*([A-Za-z0-9]+)', text)
     key_type = m.group(1).lower() if m else None
     m = re.search(r'(?:^|;)\s*p\s*=\s*([A-Za-z0-9+/=\s]*)', text)
@@ -133,6 +144,48 @@ def extract_key_material(blob):
     return key_type, b64
 
 
+def parse_key_record(blob):
+    """Return the tags of a DKIM key record (lower-case names). Empty for PEM / bare base64 keys."""
+    if not blob or "BEGIN" in blob:
+        return {}
+    text = _record_text(blob)
+    if not re.search(r'(?:^|;)\s*p\s*=', text):
+        return {}
+    tags = {}
+    for part in text.split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            tags[k.strip().lower()] = v.strip()
+    return tags
+
+
+def key_flag_info(tags):
+    """Interpret key record flags. Returns dict of readable values."""
+    t_flags = [f.strip().lower() for f in tags.get("t", "").split(":") if f.strip()]
+    h_algs = [a.strip().lower() for a in tags.get("h", "").split(":") if a.strip()]
+    info = {
+        "testing": "y" in t_flags,
+        "strict": "s" in t_flags,
+        "hash_algs": h_algs,
+        "services": tags.get("s", ""),
+        "notes": tags.get("n", ""),
+        "raw_t": tags.get("t", ""),
+    }
+    parts = []
+    if info["testing"]:
+        parts.append("t=y (testing mode)")
+    if info["strict"]:
+        parts.append("t=s (strict identity)")
+    if h_algs:
+        parts.append("h=" + ":".join(h_algs))
+    if info["services"] and info["services"] != "*":
+        parts.append("s=" + info["services"])
+    if info["notes"]:
+        parts.append("n=" + info["notes"])
+    info["summary"] = "; ".join(parts) if parts else "NONE"
+    return info
+
+
 def load_public_key(blob, algo_hint=None):
     """Return (key_object, note). algo_hint is the a= tag, used when the record has no k= tag."""
     key_type, material = extract_key_material(blob)
@@ -142,7 +195,6 @@ def load_public_key(blob, algo_hint=None):
         der = base64.b64decode(material, validate=True)
     except Exception as exc:
         raise ValueError(f"Key data is not valid base64: {exc}")
-    # Ed25519: explicit k=ed25519, or a bare 32-byte key used with an ed25519 signature
     if key_type == "ed25519" or (key_type is None and len(der) == 32 and
                                  (algo_hint or "").lower().startswith("ed25519")):
         return ed25519.Ed25519PublicKey.from_public_bytes(der), "Parsed as Ed25519 raw public key."
@@ -153,6 +205,14 @@ def load_public_key(blob, algo_hint=None):
     pem = ("-----BEGIN RSA PUBLIC KEY-----\n" + "\n".join(textwrap.wrap(material, 64)) +
            "\n-----END RSA PUBLIC KEY-----\n")
     return load_pem_public_key(pem.encode()), "Parsed as PKCS#1 RSAPublicKey."
+
+
+def key_bits(key_obj):
+    if isinstance(key_obj, rsa.RSAPublicKey):
+        return str(key_obj.key_size)
+    if isinstance(key_obj, ed25519.Ed25519PublicKey):
+        return "256"
+    return "N/A"
 
 
 def query_dns_key(domain, selector):
@@ -197,26 +257,35 @@ def preserve_key(output_root, domain, selector, key_blob, source, key_path, eml_
     """Save the key used for a signature to <output>/keys/ (once per distinct key) and track its use.
     Returns the saved file name relative to the output folder."""
     dns_name = f"{selector}._domainkey.{domain}"
-    text = key_blob.strip() + "\n"
     sha = hashlib.sha256(key_blob.encode(LATIN1, errors="replace")).hexdigest()
     rec = SAVED_KEYS.get((dns_name, sha))
     if rec is None:
         safe = re.sub(r'[^A-Za-z0-9._-]', '_', dns_name)
         k_dir = os.path.join(output_root, "keys")
         os.makedirs(k_dir, exist_ok=True)
-        # Same selector/domain but different key material (e.g. DNS vs. local file): keep both
         clash = any(n == dns_name for n, _ in SAVED_KEYS)
         fname = f"{safe}__{sha[:12]}.key" if clash else f"{safe}.key"
         with open(os.path.join(k_dir, fname), "w", encoding="utf-8", newline="\n") as kf:
-            kf.write(text)
+            kf.write(key_blob.strip() + "\n")
         try:
             k_type = extract_key_material(key_blob)[0] or "rsa (default)"
         except ValueError as exc:
             k_type = f"UNUSABLE ({exc})"
+        try:
+            bits = key_bits(load_public_key(key_blob)[0])
+        except Exception:
+            bits = "N/A"
+        flags = key_flag_info(parse_key_record(key_blob))
         rec = {"Saved_Key_File": os.path.join("keys", fname), "DKIM_Selector": selector, "DKIM_Domain": domain,
                "DNS_Name": dns_name, "Key_Source_Used": source, "Original_Key_File_Path": key_path,
                "First_Retrieved_UTC": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%SZ"),
-               "Key_SHA256": sha, "Key_Type": k_type, "Times_Used": 0, "_used_by": []}
+               "Key_SHA256": sha, "Key_Type": k_type, "Key_Bits": bits,
+               "Key_Testing_Mode": "YES" if flags["testing"] else "NO",
+               "Key_Strict_Identity": "YES" if flags["strict"] else "NO",
+               "Key_Hash_Algs": ":".join(flags["hash_algs"]) or "ANY",
+               "Key_Service_Types": flags["services"] or "* (default)",
+               "Key_Notes": flags["notes"] or "N/A", "Key_Flags_Raw": flags["raw_t"] or "N/A",
+               "Times_Used": 0, "_used_by": []}
         SAVED_KEYS[(dns_name, sha)] = rec
     rec["Times_Used"] += 1
     rec["_used_by"].append(f"{eml_name}#sig{sig_index}")
@@ -378,8 +447,9 @@ def fmt_epoch(value):
         return f"INVALID ({value})"
 
 
-def evaluate_identity(tags):
-    """RFC 6376 s3.5: the domain of i= must be the same as, or a subdomain of, d=."""
+def evaluate_identity(tags, strict=False):
+    """RFC 6376 s3.5: the domain of i= must be the same as, or a subdomain of, d=.
+    With key flag t=s (s3.6.1) the i= domain must be exactly d=."""
     d = tags.get("d", "").lower().rstrip(".")
     i = tags.get("i")
     if i is None:
@@ -388,6 +458,8 @@ def evaluate_identity(tags):
     if i_domain == d:
         return i, "OK (same as d=)", True
     if i_domain.endswith("." + d):
+        if strict:
+            return i, "INVALID (key t=s requires i= domain to equal d=)", False
         return i, "OK (subdomain of d=)", True
     return i, f"INVALID (i= domain '{i_domain}' not within d= '{d}')", False
 
@@ -395,9 +467,8 @@ def evaluate_identity(tags):
 def evaluate_times(tags, now_epoch):
     """Returns (t_str, x_str, expiry_status, expired_flag, structural_ok, notes)."""
     notes = []
-    t_val = x_val = None
+    t_val = None
     t_str = x_str = "N/A"
-    structural_ok = True
     if "t" in tags:
         t_str = fmt_epoch(tags["t"])
         try:
@@ -407,7 +478,7 @@ def evaluate_times(tags, now_epoch):
         except ValueError:
             notes.append("t= is not a valid integer")
     if "x" not in tags:
-        return t_str, x_str, "NO EXPIRY", False, structural_ok, notes
+        return t_str, x_str, "NO EXPIRY", False, True, notes
     x_str = fmt_epoch(tags["x"])
     try:
         x_val = int(tags["x"])
@@ -416,8 +487,16 @@ def evaluate_times(tags, now_epoch):
     if t_val is not None and x_val <= t_val:
         return t_str, x_str, "INVALID (x= not later than t=)", False, False, notes
     if x_val < now_epoch:
-        return t_str, x_str, "EXPIRED (at verification time)", True, structural_ok, notes
-    return t_str, x_str, "VALID (not expired)", False, structural_ok, notes
+        return t_str, x_str, "EXPIRED (at verification time)", True, True, notes
+    return t_str, x_str, "VALID (not expired)", False, True, notes
+
+
+def expiry_short(d):
+    status = d["Expiry_Status"]
+    if status == "NO EXPIRY":
+        return "x=none"
+    tag = status.split(" ")[0]
+    return f"x={d['Sig_Expiry_UTC']} [{tag}]"
 
 
 def header_date_epoch(named):
@@ -444,33 +523,39 @@ def verify_signature(index, sig_field, named, body, eml_path, mode, global_key_b
         "DKIM_Algorithm": algo, "Canonicalization": canon_str, "DKIM_Identity": "N/A", "Identity_Check": "N/A",
         "Sig_Timestamp_UTC": "N/A", "Sig_Expiry_UTC": "N/A", "Expiry_Status": "N/A",
         "Key_Source_Used": "UNKNOWN", "Key_File_Path": "N/A", "Key_SHA256": "N/A", "Saved_Key_File": "N/A",
+        "Key_Bits": "N/A", "Key_Flags": "N/A",
         "Body_Hash_Result": "ERROR", "Signature_Result": "ERROR", "Signature_Status": "ERROR",
-        "Notes": "", "_canon_body": None, "_block": None, "_key_record": None,
+        "Notes": "", "_canon_body": None, "_block": None, "_key_record": None, "_expired": False,
     }
     notes = []
     try:
         if algo not in ("rsa-sha256", "rsa-sha1", "ed25519-sha256"):
             raise ValueError(f"Unsupported signature algorithm a={algo}")
 
-        identity, id_check, id_ok = evaluate_identity(tags)
-        res["DKIM_Identity"], res["Identity_Check"] = identity, id_check
         t_str, x_str, exp_status, expired, time_ok, t_notes = evaluate_times(tags, now_epoch)
         res["Sig_Timestamp_UTC"], res["Sig_Expiry_UTC"], res["Expiry_Status"] = t_str, x_str, exp_status
+        res["_expired"] = expired
         notes.extend(t_notes)
 
         key_blob, source, key_path, key_notes = resolve_key(
             eml_path, mode, res["DKIM_Domain"], res["DKIM_Selector"], global_key_blob)
         notes.extend(key_notes)
+        flags = key_flag_info(parse_key_record(key_blob)) if key_blob else key_flag_info({})
+        identity, id_check, id_ok = evaluate_identity(tags, strict=flags["strict"])
+        res["DKIM_Identity"], res["Identity_Check"] = identity, id_check
         if not key_blob:
             res["Signature_Status"] = "NO_KEY"
             res["Body_Hash_Result"] = res["Signature_Result"] = "N/A"
             return res, notes
         res["Key_Source_Used"], res["Key_File_Path"] = source, key_path
         res["Key_SHA256"] = hashlib.sha256(key_blob.encode(LATIN1, errors="replace")).hexdigest()
+        res["Key_Flags"] = flags["summary"]
         res["_key_record"] = key_blob
         if output_root:
             res["Saved_Key_File"] = preserve_key(output_root, res["DKIM_Domain"], res["DKIM_Selector"], key_blob,
                                                  source, key_path, os.path.basename(eml_path), index)
+        if flags["testing"]:
+            notes.append("Key is in testing mode (t=y): the domain is testing DKIM; give the result less weight")
 
         # Body hash
         body_mode = (canon_str.split("/") + ["simple"])[1]
@@ -490,8 +575,8 @@ def verify_signature(index, sig_field, named, body, eml_path, mode, global_key_b
         block = build_signed_block(named, sig_field, tags)
         res["_block"] = block
         signature = base64.b64decode(tags.get("b", ""))
-        key_obj, key_note = load_public_key(key_blob, algo)
-        notes.append(key_note)
+        key_obj, _ = load_public_key(key_blob, algo)
+        res["Key_Bits"] = key_bits(key_obj)
         sig_ok = False
         try:
             if algo.startswith("rsa"):
@@ -510,10 +595,16 @@ def verify_signature(index, sig_field, named, body, eml_path, mode, global_key_b
         res["Signature_Result"] = "VERIFIED" if sig_ok else "FAILED"
         if algo == "rsa-sha1":
             notes.append("rsa-sha1 is deprecated (RFC 8301)")
+        if res["Key_Bits"] != "N/A" and algo.startswith("rsa") and int(res["Key_Bits"]) < 1024:
+            notes.append(f"RSA key is only {res['Key_Bits']} bits (RFC 8301 requires at least 1024)")
+        sig_hash = algo.split("-")[-1]
+        hash_ok = not flags["hash_algs"] or sig_hash in flags["hash_algs"]
 
         # Overall per-signature status
         if not (bh_ok and sig_ok):
             res["Signature_Status"] = "FAIL"
+        elif not hash_ok:
+            res["Signature_Status"] = f"FAIL (Key h= does not permit {sig_hash})"
         elif not id_ok:
             res["Signature_Status"] = "FAIL (Invalid i= tag)"
         elif not time_ok:
@@ -534,10 +625,11 @@ def verify_single_eml(eml_path, mode, output_root, save_bodies, save_signatures,
     row = {h: "" for h in CSV_HEADERS}
     row.update({
         "EML_Filename": os.path.basename(eml_path), "Line_Endings": "N/A",
-        "Signature_Count": 0, "Signatures_Passed": 0, "Reported_Signature": "N/A",
+        "Signature_Count": 0, "Signatures_Passed": 0, "Signatures_Expired": 0, "Reported_Signature": "N/A",
         "DKIM_Domain": "N/A", "DKIM_Selector": "N/A", "DKIM_Algorithm": "N/A", "DKIM_Identity": "N/A",
         "Identity_Check": "N/A", "Sig_Timestamp_UTC": "N/A", "Sig_Expiry_UTC": "N/A", "Expiry_Status": "N/A",
         "Key_Source_Used": "UNKNOWN", "Key_File_Path": "N/A", "Key_SHA256": "N/A", "Saved_Key_File": "N/A",
+        "Key_Bits": "N/A", "Key_Flags": "N/A",
         "Body_Hash_Result": "ERROR", "Signature_Result": "ERROR", "Overall_Status": "FAIL",
         "All_Signatures": "N/A", "Threat_Alerts": "CLEAN", "Notes": ""
     })
@@ -569,8 +661,6 @@ def verify_single_eml(eml_path, mode, output_root, save_bodies, save_signatures,
             res["Notes"] = "; ".join(notes)
             details.append(res)
             for n in notes:
-                if n.startswith("Parsed as"):
-                    continue
                 tagged = f"[sig {idx}] {n}" if len(sigs) > 1 else n
                 if tagged not in email_notes:
                     email_notes.append(tagged)
@@ -578,15 +668,17 @@ def verify_single_eml(eml_path, mode, output_root, save_bodies, save_signatures,
         passed = [d for d in details if d["Signature_Status"] == "PASS"]
         with_key = [d for d in details if d["Signature_Status"] != "NO_KEY"]
         row["Signatures_Passed"] = len(passed)
-        # Report the first passing signature; otherwise the first one that could be evaluated
+        row["Signatures_Expired"] = sum(1 for d in details if d["_expired"])
         reported = passed[0] if passed else (with_key[0] if with_key else details[0])
         row["Reported_Signature"] = f"{reported['Sig_Index']} of {len(sigs)}"
         for col in ("DKIM_Domain", "DKIM_Selector", "DKIM_Algorithm", "DKIM_Identity", "Identity_Check",
                     "Sig_Timestamp_UTC", "Sig_Expiry_UTC", "Expiry_Status", "Key_Source_Used",
-                    "Key_File_Path", "Key_SHA256", "Saved_Key_File", "Body_Hash_Result", "Signature_Result"):
+                    "Key_File_Path", "Key_SHA256", "Saved_Key_File", "Key_Bits", "Key_Flags",
+                    "Body_Hash_Result", "Signature_Result"):
             row[col] = reported[col]
         row["All_Signatures"] = " | ".join(
-            f"{d['Sig_Index']}: d={d['DKIM_Domain']} s={d['DKIM_Selector']} a={d['DKIM_Algorithm']} -> {d['Signature_Status']}"
+            f"{d['Sig_Index']}: d={d['DKIM_Domain']} s={d['DKIM_Selector']} a={d['DKIM_Algorithm']} "
+            f"{expiry_short(d)} -> {d['Signature_Status']}"
             for d in details)
 
         if passed:
@@ -595,13 +687,15 @@ def verify_single_eml(eml_path, mode, output_root, save_bodies, save_signatures,
             row["Overall_Status"] = "UNVERIFIED (Missing Public Key)"
         elif all(d["Signature_Status"].startswith("ERROR") for d in with_key):
             row["Overall_Status"] = f"RUNTIME_ERROR {with_key[0]['Signature_Status'][6:]}"
-        elif any(d["Signature_Status"] == "FAIL (Expired)" for d in with_key) and \
-                all(d["Signature_Status"] in ("FAIL (Expired)", "NO_KEY") for d in details):
+        elif all(d["Signature_Status"] in ("FAIL (Expired)", "NO_KEY") for d in details):
             row["Overall_Status"] = "FAIL (Expired)"
         else:
             row["Overall_Status"] = "FAIL"
         if len(sigs) > 1:
-            email_notes.insert(0, f"{len(sigs)} DKIM signatures found; {len(passed)} passed")
+            summary = f"{len(sigs)} DKIM signatures found; {len(passed)} passed"
+            if row["Signatures_Expired"]:
+                summary += f"; {row['Signatures_Expired']} expired"
+            email_notes.insert(0, summary)
         row["Notes"] = "; ".join(email_notes)
 
         write_artifacts(eml_path, output_root, save_bodies, save_signatures, row, details,
@@ -612,13 +706,14 @@ def verify_single_eml(eml_path, mode, output_root, save_bodies, save_signatures,
 
 
 def write_artifacts(eml_path, output_root, save_bodies, save_signatures, row, details, date_epoch):
-    evaluated = [d for d in details if d["_block"] is not None]
-    if not evaluated and not details:
+    if not details:
         return
     stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     base_name = os.path.basename(eml_path)
     multi = len(details) > 1
-    for d in evaluated:
+    for d in details:
+        if d["_block"] is None:
+            continue
         suffix = f"_sig{d['Sig_Index']}" if multi else ""
         if save_bodies:
             b_dir = os.path.join(output_root, "bodies")
@@ -646,7 +741,8 @@ def write_artifacts(eml_path, output_root, save_bodies, save_signatures, row, de
         lf.write(f"Line Endings     : {row['Line_Endings']}\n")
         lf.write(f"Date Header (UTC): {fmt_epoch(date_epoch) if date_epoch is not None else 'N/A'}\n")
         lf.write(f"Overall Result   : {row['Overall_Status']}\n")
-        lf.write(f"Signatures       : {row['Signature_Count']} found, {row['Signatures_Passed']} passed\n")
+        lf.write(f"Signatures       : {row['Signature_Count']} found, {row['Signatures_Passed']} passed, "
+                 f"{row['Signatures_Expired']} expired\n")
         lf.write(f"Threat Flagging  : {row['Threat_Alerts']}\n")
         for d in details:
             lf.write(f"{'-' * 72}\n  SIGNATURE {d['Sig_Index']} of {len(details)}\n{'-' * 72}\n")
@@ -657,7 +753,7 @@ def write_artifacts(eml_path, output_root, save_bodies, save_signatures, row, de
             lf.write(f"Identity (i=)    : {d['DKIM_Identity']}  [{d['Identity_Check']}]\n")
             lf.write(f"Signed (t=)      : {d['Sig_Timestamp_UTC']}\n")
             lf.write(f"Expires (x=)     : {d['Sig_Expiry_UTC']}  [{d['Expiry_Status']}]\n")
-            if date_epoch is not None and d["Sig_Timestamp_UTC"] not in ("N/A",) \
+            if date_epoch is not None and d["Sig_Timestamp_UTC"] != "N/A" \
                     and not d["Sig_Timestamp_UTC"].startswith("INVALID"):
                 t_epoch = int(datetime.datetime.strptime(d["Sig_Timestamp_UTC"], "%Y-%m-%d %H:%M:%SZ")
                               .replace(tzinfo=datetime.timezone.utc).timestamp())
@@ -665,6 +761,8 @@ def write_artifacts(eml_path, output_root, save_bodies, save_signatures, row, de
             lf.write(f"Key Mapping Route: {d['Key_Source_Used']}\n")
             lf.write(f"Key File         : {d['Key_File_Path']}\n")
             lf.write(f"Key SHA256       : {d['Key_SHA256']}\n")
+            lf.write(f"Key Size (bits)  : {d['Key_Bits']}\n")
+            lf.write(f"Key Flags        : {d['Key_Flags']}\n")
             lf.write(f"Key Preserved As : {d['Saved_Key_File']}\n")
             if d["_key_record"]:
                 lf.write(f"Key Record       : {d['_key_record'].strip()}\n")
@@ -706,6 +804,7 @@ def run_bulk_processing(src_dir, out_dir, mode, recursive, save_bodies, save_sig
         for file in os.listdir(src_dir):
             if file.lower().endswith(".eml"):
                 eml_targets.append(os.path.join(src_dir, file))
+    eml_targets.sort()
     if not eml_targets:
         print("No .eml files identified inside the designated scope target.")
         return
