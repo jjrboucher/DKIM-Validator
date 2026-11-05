@@ -1,14 +1,14 @@
 # DKIM Bulk Signature Verifier
 
-![Version](https://img.shields.io/badge/version-1.6.2-blue)
+![Version](https://img.shields.io/badge/version-1.7.0-blue)
 ![Build](https://img.shields.io/badge/build-2026--11--05-lightgrey)
 ![Python](https://img.shields.io/badge/python-3-yellow)
 [![License: Apache 2.0](https://img.shields.io/badge/code-Apache%202.0-blue.svg)](LICENSE)
 [![License: CC BY 4.0](https://img.shields.io/badge/docs-CC%20BY%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by/4.0/)
 
-**Version 1.6.2** (build 2026-11-05)
+**Version 1.7.0** (build 2026-11-05)
 
-A forensic triage tool that verifies the **DKIM signatures** of `.eml` files in bulk. For each message it recomputes the body hash, rebuilds the signed header block, verifies the cryptographic signature against the signing domain's public key, and records the outcome in a CSV ledger, with per-message logs and optional extracted artifacts.
+A forensic triage tool that verifies the **DKIM signatures** of `.eml` files in bulk. For each message it recomputes the body hash, rebuilds the signed header block, verifies the cryptographic signature against the signing domain's public key, and records the outcome in a CSV ledger, with per-message logs, optional extracted artifacts and a folder of preserved public keys.
 
 Built for investigators who need to show whether an email produced as evidence is an unaltered copy of what the signing mail server sent.
 
@@ -22,6 +22,7 @@ Built for investigators who need to show whether an email produced as evidence i
   - `rsa-sha256` and `rsa-sha1`
   - `simple` and `relaxed` canonicalisation (headers and body), `l=` body length tag
 - **Three public-key modes** – live DNS with local fallbacks, 1:1 sidecar key files, or N:1 shared key files
+- **Key preservation** – keys retrieved from DNS are saved as `selector._domainkey.domain.key` for offline re-verification
 - **Flexible key input** – DNS TXT records, zone-file lines, bare base64, PEM, DER or PKCS#1; revoked keys (empty `p=`) detected
 - **Key provenance** – records which source supplied the key, the key file path, and the SHA-256 of the key used
 - **Keyword alerts** – optional regex scanning of message bodies, with default fraud/phishing patterns and custom pattern files
@@ -67,9 +68,11 @@ Configure the run in the window, then click **LAUNCH TRIAGE PROCESSING LOOP**. P
 | | Save canonicalised bodies (`bodies/`) | On |
 | | Save signed header blocks (`signatures/`) | On |
 | Public Key Mapping | Mode 1 / 2 / 3 | Mode 1 |
-| | Global Manual Key Fallback (Mode 3 only) | None |
+| | Global Manual Key Fallback (Mode 3 only) – paste or **Load Key File...** | None |
 | Keyword Alerts | Enable body keyword flagging | Off |
 | | Load Custom Keywords File (.txt) | – |
+
+A status line under the global key button shows whether a key is registered and whether it was pasted or loaded from a file.
 
 Before launching, every keyword pattern is compiled and any invalid regex is reported with its line number. In Mode 3 you are warned if no global key is registered and no `*_domainkey*.key` files are found.
 
@@ -85,12 +88,12 @@ python verify_dkim_bulk.py --no-gui --src <source_folder> --out <output_folder> 
 | `--src` | Folder containing `.eml` files (required with `--no-gui`) |
 | `--out` | Output folder (required with `--no-gui`) |
 | `--mode {1,2,3}` | Public key mode (required with `--no-gui`) |
-| `-h`, `--help` | Show help |
+| `-h`, `--help` | Show help, version, repository and license |
 
-In CLI mode, recursion and artifact saving are always **on**, keyword alerts are **off**, and the global manual key is not available.
+In CLI mode, recursion, artifact saving and DNS key saving are always **on**, keyword alerts are **off**, and the global manual key is not available.
 
 ```bash
-# Live DNS with local fallbacks
+# Live DNS with local fallbacks (retrieved keys saved to ./dkim_out/keys)
 python verify_dkim_bulk.py --no-gui --src ./eml --out ./dkim_out --mode 1
 
 # Fully offline using shared key files
@@ -118,7 +121,19 @@ evidence/
 └── selector1._domainkey.example.com.key    ← Mode 3: shared by msg001 and msg002
 ```
 
-> **Tip:** Capture the DKIM TXT record at intake (e.g. `nslookup -type=TXT selector1._domainkey.example.com`) and save it as a nomenclature `.key` file. Mode 3 then produces repeatable, offline results.
+### Key preservation (`keys/` folder)
+
+| Source | Saved as | Notes |
+|---|---|---|
+| Mode 1 – key retrieved from live DNS | `keys/<selector>._domainkey.<domain>.key` | Only DNS keys are saved; local fallback files are not copied |
+| Mode 3 – global key **pasted** in the GUI | `keys/global_user_supplied.key` | Saved at launch |
+| Mode 3 – global key **loaded from a file** (unedited) | *not copied* | The original file path is recorded in `Key_File_Path` |
+
+- Files contain the key text exactly as used, so each file's SHA-256 matches `Key_SHA256` in the CSV.
+- Existing files are **never overwritten**. If a different key is retrieved for a name that already exists, it is saved as `<selector>._domainkey.<domain>.<UTCstamp>.key`.
+- Selector/domain values come from the email header. Unsafe characters are replaced with `_`, so a crafted header cannot write outside `keys/`.
+
+> **Tip:** Copy the files from `keys/` next to the `.eml` files and re-run in Mode 3 for repeatable, offline results that don't depend on later key rotation.
 
 > **Privacy note:** Mode 1 sends the selector and domain of each message to a third-party DNS resolver.
 
@@ -144,6 +159,7 @@ Patterns are matched against the **raw, undecoded** MIME body, so text inside ba
 ```text
 <output_folder>/
 ├── dkim_bulk_verification_report.csv        # one row per .eml
+├── keys/        <selector>._domainkey.<domain>.key, global_user_supplied.key
 ├── logs/        <email>_<UTCstamp>.log
 ├── bodies/      <email>_body_<UTCstamp>.txt
 └── signatures/  <email>_dkim_signature_<UTCstamp>.txt
@@ -151,7 +167,8 @@ Patterns are matched against the **raw, undecoded** MIME body, so text inside ba
 
 - Timestamps are UTC (`YYYYMMDDTHHMMSSZ`).
 - The CSV is overwritten on each run to the same output folder; use a new folder per run to keep history.
-- Logs and artifacts are written only for messages that reach the signature check.
+- Logs and artifacts are written only for messages that reach the signature check. Logs include the key file path and key SHA-256.
+- `keys/` is created only when a key is saved.
 
 ### CSV columns
 
@@ -161,7 +178,7 @@ Patterns are matched against the **raw, undecoded** MIME body, so text inside ba
 | `MD5_Hash`, `SHA256_Hash` | Hashes of the original file |
 | `DKIM_Domain`, `DKIM_Selector` | `d=` and `s=` tags |
 | `Key_Source_Used` | `CACHE_MEMORY`, `LIVE_DNS_QUERY`, `FALLBACK_SIDECAR_FILE`, `FALLBACK_NOMENCLATURE_FILE`, `SIDECAR_FILE`, `N1_NOMENCLATURE_FILE`, `GLOBAL_USER_SUPPLIED_KEY`, `UNKNOWN` |
-| `Key_File_Path` | Local key file used, or `N/A` |
+| `Key_File_Path` | Key file used (including `keys/` files for DNS and pasted global keys), or `N/A` |
 | `Key_SHA256` | SHA-256 of the key text used |
 | `Body_Hash_Result` | `MATCH` / `MISMATCH` / `ERROR` |
 | `Signature_Result` | `VERIFIED` / `FAILED` / `ERROR` |
@@ -181,25 +198,27 @@ A `FAIL` is not by itself proof of tampering. Mailing lists, security gateways, 
 
 ---
 
-## Known limitations (v1.6.2)
+## Known limitations (v1.7.0)
 
-- **Mode 1 DNS URL:** the DNS-over-HTTPS URL in `query_dns_key()` appears to be missing `/resolve?name=` (expected form: `https://dns.google/resolve?name=<selector>._domainkey.<domain>&type=TXT`). Lookup errors are suppressed, so Mode 1 may fall through to the local key files.
 - Only the **first** `DKIM-Signature` header is verified.
 - Header parsing and canonicalisation assume **CRLF** line endings; LF-only `.eml` files may fail.
 - **Ed25519** signatures are verified over the raw header block rather than its SHA-256 digest (RFC 8463), so `ed25519-sha256` signatures are likely to report `FAILED`.
 - The `x=` (expiry), `t=` (timestamp) and `i=` (identity) tags are not evaluated.
+- DNS/network errors are not reported; a failed lookup is treated as "no answer" and the local fallbacks are used.
+- No command-line option for a global key.
 
 ---
 
 ## Documentation
 
-See **`DKIM_Bulk_Verifier_User_Guide_v1.6.2.pdf`** for the full user guide.
+See **`DKIM_Bulk_Verifier_User_Guide_v1.7.0.pdf`** for the full user guide.
 
 ## Changelog
 
 | Version | Date | Notes |
 |---|---|---|
-| 1.6.2 | 2026-11-05 | Current release |
+| 1.7.0 | 2026-11-05 | Mode 1 saves DNS-retrieved keys to `keys/` using the `selector._domainkey.domain.key` nomenclature (never overwrites; timestamped copy if a key changes); Mode 3 saves a GUI-pasted global key to `keys/global_user_supplied.key`; **Load Key File...** button and status line for the global key; fixed the Mode 1 DNS-over-HTTPS URL and parsing of multi-string TXT / CNAME answers; `Key_File_Path` populated for DNS and global keys; logs include key file and key SHA-256; filename sanitisation for header-derived names; Apache 2.0 notice in script header, GUI and `--help` |
+| 1.6.2 | 2026-11-05 | Initial documented release |
 
 ## License
 
@@ -211,7 +230,7 @@ This project is free to use and is dual-licensed by component:
 | Documentation (`README.md`, user guide PDF) | [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/) |
 
 **Suggested attribution for the documentation:**
-*"DKIM Bulk Signature Verifier – User Guide (v1.6.2)" by Jacques Boucher, https://github.com/jjrboucher/DKIM-Validator, licensed under CC BY 4.0.*
+*"DKIM Bulk Signature Verifier – User Guide (v1.7.0)" by Jacques Boucher, https://github.com/jjrboucher/DKIM-Validator, licensed under CC BY 4.0.*
 
 ## Disclaimer
 
